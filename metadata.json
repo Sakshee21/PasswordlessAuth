@@ -1,0 +1,6 @@
+
+{
+  "name": "SecureBank Academic Demo",
+  "description": "An academic cybersecurity demonstration platform showcasing public-key auth, context-aware nonces, and risk-based access control.",
+  "requestFramePermissions": []
+}
