@@ -14,6 +14,7 @@ import { useAudit } from '../components/SecurityAuditPanel';
 
 interface LoginProps {
   onLoginSuccess: (username: string) => void;
+  stepUpOperation?: string | null;
 }
 
 const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {

@@ -2,35 +2,30 @@
  * deviceKey.ts
  * Device-Bound Private Key Protection
  *
- * Flow:
- *   Registration : generate keypair → derive MasterKey from device fingerprint
- *                  → AES-GCM encrypt private key → store encrypted bundle in localStorage
- *
- *   Login        : re-derive MasterKey from same fingerprint + stored salt
- *                  → decrypt private key in RAM → sign nonce → zero bytes → done
+ * Implements the full registration + authentication key lifecycle:
+ *   1. Collect device fingerprint (async — canvas, WebGL, audio, fonts, navigator, screen, timezone, media)
+ *   2. Derive AES-GCM master key via PBKDF2-SHA256(fingerprint + random salt, 310 000 iterations)
+ *   3. Encrypt the RSA private key with master key → store encrypted bundle in localStorage
+ *   4. On login: re-derive master key, decrypt in RAM, sign challenge nonce, wipe bytes
  *
  * The plaintext private key NEVER touches disk.
- * Moving the encrypted bundle to another device = decryption failure.
+ * Copying the encrypted bundle to another device = decryption failure.
  */
 
 import type { LogLevel } from '../components/SecurityAuditPanel';
 
-// ─── Logger type (injected from UI so audit panel can receive events) ─────────
-export type AuditLogger = (
-  level: LogLevel,
-  message: string,
-  detail?: string
-) => void;
-
+// ─── Logger (injected from UI so audit panel can receive events) ──────────────
+export type AuditLogger = (level: LogLevel, message: string, detail?: string) => void;
 const noop: AuditLogger = () => {};
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
 const STORAGE_KEY = (username: string) => `securebank_key_${username}`;
 
+// ─── Types ────────────────────────────────────────────────────────────────────
 export interface EncryptedKeyBundle {
-  encryptedKey: string;
-  salt: string;
-  iv: string;
+  encryptedKey: string; // base64 AES-GCM ciphertext of pkcs8 private key
+  salt: string;         // base64 random salt used in PBKDF2
+  iv: string;           // base64 AES-GCM nonce
 }
 
 // ─── Device Fingerprint ───────────────────────────────────────────────────────
@@ -50,8 +45,8 @@ export interface EncryptedKeyBundle {
  *  • Fonts       — measured width differences across a probe string in several fonts
  *  • Media       — supported MIME types
  *
- * All signals are deterministic for the same device+browser+profile.
- * The result is hashed with SHA-256 before use so the raw strings are never
+ * All signals are deterministic for the same device + browser + profile.
+ * The result is hashed with SHA-256 before use so raw strings are never
  * exposed — only a 32-byte digest feeds into PBKDF2.
  */
 export async function collectDeviceFingerprint(): Promise<string> {
@@ -64,7 +59,7 @@ export async function collectDeviceFingerprint(): Promise<string> {
     (navigator.languages ?? []).join(','),
     navigator.platform ?? '',
     String(navigator.hardwareConcurrency ?? ''),
-    String((navigator as any).deviceMemory ?? ''),       // GB RAM (rounded)
+    String((navigator as any).deviceMemory ?? ''),     // GB RAM (rounded)
     String(navigator.maxTouchPoints ?? '0'),
     String(navigator.cookieEnabled),
     String((navigator as any).pdfViewerEnabled ?? ''),
@@ -83,7 +78,7 @@ export async function collectDeviceFingerprint(): Promise<string> {
   // ── 3. Timezone ─────────────────────────────────────────────────────────────
   parts.push(Intl.DateTimeFormat().resolvedOptions().timeZone);
 
-  // ── 4. Canvas 2D fingerprint ─────────────────────────────────────────────────
+  // ── 4. Canvas 2D fingerprint ──────────────────────────────────────────────
   // Different GPU drivers render text and gradients subtly differently.
   try {
     const canvas  = document.createElement('canvas');
@@ -100,7 +95,6 @@ export async function collectDeviceFingerprint(): Promise<string> {
     ctx.beginPath();
     ctx.arc(200, 30, 18, 0, Math.PI * 2);
     ctx.stroke();
-    // Gradient
     const grad = ctx.createLinearGradient(0, 0, 240, 0);
     grad.addColorStop(0, 'rgba(100,200,100,0.6)');
     grad.addColorStop(1, 'rgba(200,100,200,0.6)');
@@ -109,7 +103,7 @@ export async function collectDeviceFingerprint(): Promise<string> {
     parts.push(canvas.toDataURL());
   } catch { parts.push('canvas:unavailable'); }
 
-  // ── 5. WebGL fingerprint (most hardware-specific browser signal) ─────────────
+  // ── 5. WebGL fingerprint (most hardware-specific browser signal) ──────────
   try {
     const gl = document.createElement('canvas')
       .getContext('webgl') as WebGLRenderingContext | null;
@@ -117,8 +111,8 @@ export async function collectDeviceFingerprint(): Promise<string> {
       const dbgInfo = gl.getExtension('WEBGL_debug_renderer_info');
       if (dbgInfo) {
         parts.push(
-          gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL),   // e.g. "NVIDIA GeForce RTX 3080"
-          gl.getParameter(dbgInfo.UNMASKED_VENDOR_WEBGL),     // e.g. "NVIDIA Corporation"
+          gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL), // e.g. "NVIDIA GeForce RTX 3080"
+          gl.getParameter(dbgInfo.UNMASKED_VENDOR_WEBGL),   // e.g. "NVIDIA Corporation"
         );
       }
       parts.push(
@@ -145,21 +139,21 @@ export async function collectDeviceFingerprint(): Promise<string> {
     }
   } catch { parts.push('audio:unavailable'); }
 
-  // ── 7. Font metric fingerprint ──────────────────────────────────────────────
+  // ── 7. Font metric fingerprint ───────────────────────────────────────────
   // Different OS font renderers produce slightly different measured widths.
   try {
     const probe = 'mmmmmmmmmmlli';
     const testFonts = ['monospace', 'serif', 'sans-serif', 'Arial', 'Georgia', 'Courier New'];
     const canvas = document.createElement('canvas');
     const ctx    = canvas.getContext('2d')!;
-    const widths  = testFonts.map(f => {
+    const widths = testFonts.map(f => {
       ctx.font = `16px ${f}`;
       return ctx.measureText(probe).width.toFixed(2);
     });
     parts.push(widths.join(','));
   } catch { parts.push('fonts:unavailable'); }
 
-  // ── 8. Supported media types ────────────────────────────────────────────────
+  // ── 8. Supported media types ─────────────────────────────────────────────
   try {
     const video = document.createElement('video');
     const probeTypes = [
@@ -170,7 +164,7 @@ export async function collectDeviceFingerprint(): Promise<string> {
     parts.push(probeTypes.map(t => video.canPlayType(t)).join(','));
   } catch { parts.push('media:unavailable'); }
 
-  // ── Hash everything into a single 32-byte digest ────────────────────────────
+  // ── Hash everything into a single 32-byte digest ──────────────────────────
   const raw     = parts.join('||');
   const encoded = new TextEncoder().encode(raw);
   const hashBuf = await crypto.subtle.digest('SHA-256', encoded);
@@ -178,7 +172,7 @@ export async function collectDeviceFingerprint(): Promise<string> {
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 
-  return hashHex;   // 64-char hex string → feeds into PBKDF2 as "password"
+  return hashHex; // 64-char hex string → feeds into PBKDF2 as "password"
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -190,6 +184,7 @@ function base64Encode(buf: ArrayBuffer): string {
 }
 
 function base64Decode(b64: string): Uint8Array<ArrayBuffer> {
+  // .slice() guarantees the backing buffer is a plain ArrayBuffer, not ArrayBufferLike
   return Uint8Array.from(atob(b64), c => c.charCodeAt(0)).slice();
 }
 
@@ -198,10 +193,14 @@ function truncate(b64: string, chars = 24): string {
 }
 
 // ─── KDF ──────────────────────────────────────────────────────────────────────
+/**
+ * Derives a 256-bit AES-GCM key from (fingerprint, salt) using PBKDF2-SHA256.
+ * 310,000 iterations aligns with OWASP 2023 recommendation for PBKDF2-HMAC-SHA256.
+ */
 async function deriveMasterKey(
   fingerprint: string,
   salt: Uint8Array<ArrayBuffer>,
-  log: AuditLogger
+  log: AuditLogger = noop
 ): Promise<CryptoKey> {
   const encoder = new TextEncoder();
 
@@ -216,7 +215,7 @@ async function deriveMasterKey(
   );
 
   log('crypto', 'Running PBKDF2-SHA256 (310,000 iterations) to derive MasterKey…',
-      `salt=${truncate(base64Encode(salt.buffer))}`);
+    `salt=${truncate(base64Encode(salt.buffer))}`);
 
   const masterKey = await crypto.subtle.deriveKey(
     { name: 'PBKDF2', salt, iterations: 310_000, hash: 'SHA-256' },
@@ -230,7 +229,12 @@ async function deriveMasterKey(
   return masterKey;
 }
 
-// ─── Encrypt & Store ──────────────────────────────────────────────────────────
+// ─── Encrypt & Store Private Key ──────────────────────────────────────────────
+/**
+ * Called once after key pair generation.
+ * Encrypts the private key and saves the bundle to localStorage.
+ * The plaintext private key bytes are zeroed after use.
+ */
 export async function encryptAndStorePrivateKey(
   username: string,
   privateKey: CryptoKey,
@@ -244,7 +248,7 @@ export async function encryptAndStorePrivateKey(
   const salt = crypto.getRandomValues(new Uint8Array(32)).slice() as Uint8Array<ArrayBuffer>;
   const iv   = crypto.getRandomValues(new Uint8Array(12)).slice() as Uint8Array<ArrayBuffer>;
   log('crypto', 'Generated random salt (32 bytes) and IV (12 bytes)',
-      `salt=${truncate(base64Encode(salt.buffer))} iv=${truncate(base64Encode(iv.buffer))}`);
+    `salt=${truncate(base64Encode(salt.buffer))} iv=${truncate(base64Encode(iv.buffer))}`);
 
   log('info', 'Collecting device fingerprint (canvas, WebGL, audio, fonts, navigator…)');
   const fingerprint = await collectDeviceFingerprint();
@@ -271,8 +275,8 @@ export async function encryptAndStorePrivateKey(
 
   localStorage.setItem(STORAGE_KEY(username), JSON.stringify(bundle));
   log('success',
-      'Encrypted bundle saved to localStorage (encryptedKey + salt + iv)',
-      `key=${truncate(bundle.encryptedKey)}`);
+    'Encrypted bundle saved to localStorage (encryptedKey + salt + iv)',
+    `key=${truncate(bundle.encryptedKey)}`);
   log('info', 'Server receives public key only. Private key never leaves this device.');
 }
 
@@ -291,7 +295,14 @@ export function deleteStoredKey(username: string): void {
   localStorage.removeItem(STORAGE_KEY(username));
 }
 
-// ─── Decrypt & Sign ───────────────────────────────────────────────────────────
+// ─── Decrypt & Sign (Authentication Phase) ────────────────────────────────────
+/**
+ * Temporarily decrypts the private key in RAM, signs the challenge nonce,
+ * then zeroes the key bytes.
+ *
+ * If the device fingerprint has changed (different machine / major browser update)
+ * decryption will produce garbage → importKey throws → authentication fails cleanly.
+ */
 export async function decryptAndSign(
   username: string,
   nonceBase64: string,
@@ -348,7 +359,7 @@ export async function decryptAndSign(
     nonceBytes
   );
 
-  log('success', 'Nonce signed successfully — private key object will be GC\'d by browser');
+  log('success', "Nonce signed successfully — private key object will be GC'd by browser");
   log('network', 'Sending signature to server for RSA-PSS verification with stored public key…');
 
   const sigBytes = new Uint8Array(signatureBuffer);

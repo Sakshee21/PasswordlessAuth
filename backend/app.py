@@ -1,80 +1,152 @@
+"""
+SecureBank Backend (Merged Version)
 
+Features
+• RSA nonce challenge authentication
+• Context-bound nonce protection
+• Risk Policy Engine evaluation
+• Step-up authentication
+• Tamper-evident audit logs (hash chained)
+• Session + IP tracking
+"""
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import sqlite3
 import base64
-import os
 import hashlib
+import json
+import secrets
+import sqlite3
 import time
-from cryptography.hazmat.primitives import hashes
+
+from flask import Flask, g, jsonify, request
+from flask_cors import CORS
+
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
+from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 
+from risk_policy import RiskPolicyEngine
+
+
 app = Flask(__name__)
-CORS(app,resources={r"/*": {"origins": "*"}})
+CORS(app)
 
-DB_FILE = "securebank.db"
+DB_PATH = "securebank.db"
+NONCE_TTL = 60
 
-LOGIN_NONCES = {}
-OPERATION_NONCES = {}
-OPERATION_BASE_RISK = {
-    "READ": 0.2,
-    "WRITE": 0.4,
-    "TRANSFER": 0.6,
-    "DELETE": 0.9
-}
+risk_engine = RiskPolicyEngine()
+
+
+# =====================================================
+# DATABASE CONNECTION
+# =====================================================
+
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(e=None):
+    db = g.pop("db", None)
+    if db:
+        db.close()
+
+
 # =====================================================
 # DATABASE INIT
 # =====================================================
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    db = get_db()
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            public_key TEXT NOT NULL,
-            last_ip TEXT
-        )
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        public_key TEXT NOT NULL,
+        created_at REAL,
+        last_ip TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS nonces (
+        token TEXT PRIMARY KEY,
+        username TEXT,
+        operation TEXT,
+        context_hash TEXT,
+        expires_at REAL,
+        used INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+        username TEXT PRIMARY KEY,
+        login_timestamp REAL,
+        fingerprint TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user TEXT,
+        action TEXT,
+        result TEXT,
+        risk_score REAL,
+        reason TEXT,
+        timestamp REAL,
+        hash TEXT
+    );
     """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user TEXT,
-            result TEXT,
-            timestamp REAL,
-            riskScore REAL,
-            action TEXT,
-            prev_hash TEXT,
-            current_hash TEXT
-        )
-    """)
+    db.commit()
 
-    conn.commit()
-    conn.close()
-
-init_db()
 
 # =====================================================
-# HELPER FUNCTIONS
+# AUDIT LOG HASH CHAIN
 # =====================================================
 
-def compute_hash(data):
-    return hashlib.sha256(data.encode()).hexdigest()
+def previous_hash(db):
+    row = db.execute(
+        "SELECT hash FROM audit_logs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
 
+    return row["hash"] if row else "GENESIS"
+
+
+def write_audit(db, user, action, result, risk=0, reason=None):
+
+    prev = previous_hash(db)
+    ts = time.time()
+
+    entry = f"{prev}|{user}|{action}|{result}|{risk}|{ts}"
+    new_hash = hashlib.sha256(entry.encode()).hexdigest()
+
+    db.execute(
+        """INSERT INTO audit_logs
+        (user, action, result, risk_score, reason, timestamp, hash)
+        VALUES (?,?,?,?,?,?,?)""",
+        (user, action, result, risk, reason, ts, new_hash),
+    )
+
+    db.commit()
+
+
+# =====================================================
+# SIGNATURE VERIFICATION
+# =====================================================
 
 def verify_signature(public_key_pem, nonce_b64, signature_b64):
-    try:
-        public_key = load_pem_public_key(public_key_pem.encode())
-        signature = base64.b64decode(signature_b64)
-        nonce_bytes = base64.b64decode(nonce_b64)
 
-        public_key.verify(
-            signature,
+    try:
+        pub = serialization.load_pem_public_key(
+            public_key_pem.encode(),
+            backend=default_backend()
+        )
+
+        nonce_bytes = base64.b64decode(nonce_b64)
+        sig_bytes = base64.b64decode(signature_b64)
+
+        pub.verify(
+            sig_bytes,
             nonce_bytes,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
@@ -82,441 +154,384 @@ def verify_signature(public_key_pem, nonce_b64, signature_b64):
             ),
             hashes.SHA256()
         )
+
         return True
-    except Exception as e:
-        print("Verification error:", e)
+
+    except (InvalidSignature, Exception):
         return False
 
-def calculate_operation_risk(username, operation, ip, context):
-    risk = 0.0
-    amount = context.get("amount", 0)
-
-    # 1️⃣ Base Operation Risk
-    if operation == "TRANSFER":
-        risk += 0.2
-    elif operation == "CLOSE_ACCOUNT":
-        risk += 0.6
-    elif operation == "ACCOUNT_DETAILS":
-        risk += 0.3
-    elif operation == "SENSITIVE_RECORDS":
-        risk += 0.1
-
-    # 2️⃣ Transaction Amount Risk (progressive, not static)
-    if amount > 10000:
-        risk += 0.5
-    elif amount > 5000:
-        risk += 0.3
-    elif amount > 1000:
-        risk += 0.1
-
-    # 3️⃣ IP Anomaly
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT last_ip FROM users WHERE username=?", (username,))
-    row = c.fetchone()
-    conn.close()
-
-    if row and row[0] and row[0] != ip:
-        risk += 0.3
-
-    # 4️⃣ Time-Based Risk (Unusual time demo)
-    current_hour = time.localtime().tm_hour
-    if current_hour < 6 or current_hour > 22:
-        risk += 0.2
-
-    # 5️⃣ Rapid Activity Risk (simple memory tracking)
-    if username in OPERATION_NONCES:
-        risk += 0.1
-
-    return min(risk, 1.0)
-# def calculate_operation_risk(username, operation, context, ip):
-#     risk = 0
-
-#     # 1️⃣ Base operation risk
-#     OPERATION_BASE_RISK = {
-#         "READ": 0.2,
-#         "WRITE": 0.4,
-#         "TRANSFER": 0.5,
-#         "DELETE": 0.9
-#     }
-
-#     risk += OPERATION_BASE_RISK.get(operation, 0)
-
-#     # 2️⃣ Transaction amount risk
-#     if operation == "TRANSFER":
-#         amount = float(context.get("amount", 0))
-
-#         if amount > 10000:
-#             risk += 0.4
-#         elif amount > 5000:
-#             risk += 0.2
-
-#     # 3️⃣ IP anomaly detection
-#     conn = sqlite3.connect(DB_FILE)
-#     c = conn.cursor()
-#     c.execute("SELECT last_ip FROM users WHERE username=?", (username,))
-#     row = c.fetchone()
-#     conn.close()
-
-#     if row and row[0] and row[0] != ip:
-#         risk += 0.3
-
-#     # 4️⃣ Unusual time detection
-#     current_hour = time.localtime().tm_hour
-
-#     # Assume normal hours = 8 AM to 8 PM
-#     if current_hour < 8 or current_hour > 20:
-#         risk += 0.2
-
-#     # 5️⃣ Rapid request detection
-#     conn = sqlite3.connect(DB_FILE)
-#     c = conn.cursor()
-#     c.execute("""
-#         SELECT COUNT(*) FROM logs
-#         WHERE user=? AND timestamp > ?
-#     """, (username, time.time() - 30))
-#     recent_requests = c.fetchone()[0]
-#     conn.close()
-
-#     if recent_requests > 5:
-#         risk += 0.2
-
-#     return min(risk, 1.0)   
-
-def log_event(username, result, risk, action):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-
-    c.execute("SELECT current_hash FROM logs ORDER BY id DESC LIMIT 1")
-    prev = c.fetchone()
-    prev_hash = prev[0] if prev else "GENESIS"
-
-    timestamp = time.time()
-    log_data = f"{username}{result}{timestamp}{risk}{action}"
-    current_hash = compute_hash(prev_hash + log_data)
-
-    c.execute("""
-        INSERT INTO logs 
-        (user, result, timestamp, riskScore, action, prev_hash, current_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        username, result, timestamp, risk, action,
-        prev_hash, current_hash
-    ))
-
-    conn.commit()
-    conn.close()
-
 
 # =====================================================
-# USER REGISTRATION
+# REGISTER
 # =====================================================
 
-@app.route("/register", methods=["POST"])
+@app.post("/register")
 def register():
+
     data = request.json
-    username = data["username"]
-    public_key = data["publicKey"]
+    username = data.get("username")
+    public_key = data.get("publicKey")
 
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    db = get_db()
 
-    c.execute("SELECT username FROM users WHERE username=?", (username,))
-    if c.fetchone():
-        conn.close()
+    exists = db.execute(
+        "SELECT username FROM users WHERE username=?",
+        (username,)
+    ).fetchone()
+
+    if exists:
         return jsonify({"status": "EXISTS"})
 
-    c.execute("INSERT INTO users (username, public_key) VALUES (?, ?)",
-              (username, public_key))
-    conn.commit()
-    conn.close()
+    db.execute(
+        "INSERT INTO users VALUES (?,?,?,?)",
+        (username, public_key, time.time(), None)
+    )
+
+    db.commit()
+
+    write_audit(db, username, "REGISTER", "SUCCESS")
 
     return jsonify({"status": "REGISTERED"})
 
 
 # =====================================================
-# LOGIN (RSA AUTH)
+# LOGIN CHALLENGE
 # =====================================================
 
-# @app.route("/challenge", methods=["POST"])
-# def challenge():
-#     username = request.json["username"]
-
-#     nonce = base64.b64encode(os.urandom(32)).decode()
-#     LOGIN_NONCES[username] = nonce
-
-#     return jsonify({"nonce": nonce})
-
-@app.route("/challenge", methods=["POST"])
+@app.post("/challenge")
 def challenge():
+
     username = request.json["username"]
 
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT username FROM users WHERE username=?", (username,))
-    exists = c.fetchone()
-    conn.close()
+    db = get_db()
 
-    if not exists:
+    user = db.execute(
+        "SELECT username FROM users WHERE username=?",
+        (username,)
+    ).fetchone()
+
+    if not user:
         return jsonify({"error": "User not found"}), 404
 
-    nonce = base64.b64encode(os.urandom(32)).decode()
-    LOGIN_NONCES[username] = nonce
+    nonce_bytes = secrets.token_bytes(32)
+    nonce_b64 = base64.b64encode(nonce_bytes).decode()
 
-    return jsonify({"nonce": nonce})
-# @app.route("/login", methods=["POST"])
-# def login():
-#     data = request.json
-#     username = data["username"]
-#     signature = data["signature"]
+    expires = time.time() + NONCE_TTL
 
-#     if username not in LOGIN_NONCES:
-#         return jsonify({"status": "DENIED"})
+    db.execute(
+        "INSERT INTO nonces VALUES (?,?,?,?,?,0)",
+        (nonce_b64, username, "LOGIN", None, expires)
+    )
 
-#     nonce = LOGIN_NONCES.pop(username)
+    db.commit()
 
-#     conn = sqlite3.connect(DB_FILE)
-#     c = conn.cursor()
-#     c.execute("SELECT public_key FROM users WHERE username=?", (username,))
-#     row = c.fetchone()
-#     conn.close()
+    return jsonify({"nonce": nonce_b64})
 
-#     if not row:
-#         return jsonify({"status": "DENIED"})
 
-#     ok = verify_signature(row[0], nonce, signature)
-#     ip = request.remote_addr
+# =====================================================
+# LOGIN VERIFY
+# =====================================================
 
-#     if ok:
-#         conn = sqlite3.connect(DB_FILE)
-#         c = conn.cursor()
-#         c.execute("UPDATE users SET last_ip=? WHERE username=?", (ip, username))
-#         conn.commit()
-#         conn.close()
-
-#     risk = 0.1 if ok else 0.9
-#     log_event(username, "LOGIN_SUCCESS" if ok else "LOGIN_DENIED", risk, "LOGIN")
-
-#     return jsonify({"status": "SUCCESS" if ok else "DENIED"})
-@app.route("/login", methods=["POST"])
+@app.post("/login")
 def login():
-    try:
-        data = request.json
-        username = data.get("username")
-        signature = data.get("signature")
 
-        if not username or not signature:
-            return jsonify({"status": "DENIED", "error": "Missing data"})
-
-        if username not in LOGIN_NONCES:
-            return jsonify({"status": "DENIED", "error": "No nonce found"})
-
-        nonce = LOGIN_NONCES.pop(username)
-
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT public_key FROM users WHERE username=?", (username,))
-        row = c.fetchone()
-        conn.close()
-
-        if not row:
-            return jsonify({"status": "DENIED", "error": "User not found"})
-
-        ok = verify_signature(row[0], nonce, signature)
-
-        ip = request.remote_addr
-
-        if ok:
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("UPDATE users SET last_ip=? WHERE username=?", (ip, username))
-            conn.commit()
-            conn.close()
-
-        risk = 0.1 if ok else 0.9
-        log_event(username, "LOGIN_SUCCESS" if ok else "LOGIN_DENIED", risk, "LOGIN")
-        print("Nonce from memory:", nonce)
-        print("Signature received:", signature[:20])
-        return jsonify({"status": "SUCCESS" if ok else "DENIED"})
-
-    except Exception as e:
-        print("LOGIN ERROR:", e)
-        return jsonify({"status": "ERROR", "message": str(e)}), 500
-
-# =====================================================
-# CONTEXT-AWARE OPERATION CHALLENGE
-# =====================================================
-
-# @app.route("/operation-challenge", methods=["POST"])
-# def operation_challenge():
-#     data = request.json
-#     username = data["username"]
-#     operation = data["operation"]
-
-#     nonce = base64.b64encode(os.urandom(16)).decode()
-
-#     OPERATION_NONCES[username] = {
-#         "nonce": nonce,
-#         "operation": operation,
-#         "timestamp": time.time()
-#     }
-
-#     return jsonify({"nonce": nonce, "operation": operation})
-
-@app.route("/operation-challenge", methods=["POST"])
-def operation_challenge():
     data = request.json
+
+    username = data["username"]
+    signature = data["signature"]
+    fingerprint = data.get("deviceFingerprint")
+
+    db = get_db()
+
+    user = db.execute(
+        "SELECT public_key FROM users WHERE username=?",
+        (username,)
+    ).fetchone()
+
+    if not user:
+        return jsonify({"status": "FAILED"}), 404
+
+    nonce = db.execute(
+        """SELECT token, expires_at
+        FROM nonces
+        WHERE username=? AND operation='LOGIN' AND used=0
+        ORDER BY expires_at DESC LIMIT 1""",
+        (username,)
+    ).fetchone()
+
+    if not nonce:
+        return jsonify({"status": "FAILED", "reason": "No nonce"})
+
+    if time.time() > nonce["expires_at"]:
+        return jsonify({"status": "FAILED", "reason": "Expired"})
+
+    ok = verify_signature(user["public_key"], nonce["token"], signature)
+
+    if not ok:
+        write_audit(db, username, "LOGIN", "DENIED")
+        return jsonify({"status": "FAILED"}), 401
+
+    db.execute(
+        "UPDATE nonces SET used=1 WHERE token=?",
+        (nonce["token"],)
+    )
+
+    ip = request.remote_addr
+
+    db.execute(
+        """INSERT INTO sessions VALUES (?,?,?)
+        ON CONFLICT(username)
+        DO UPDATE SET login_timestamp=?, fingerprint=?""",
+        (username, time.time(), fingerprint,
+         time.time(), fingerprint)
+    )
+
+    db.execute(
+        "UPDATE users SET last_ip=? WHERE username=?",
+        (ip, username)
+    )
+
+    db.commit()
+
+    write_audit(db, username, "LOGIN", "SUCCESS")
+
+    return jsonify({"status": "SUCCESS"})
+
+
+# =====================================================
+# OPERATION CHALLENGE
+# =====================================================
+
+@app.post("/operation-challenge")
+def operation_challenge():
+
+    data = request.json
+
     username = data["username"]
     operation = data["operation"]
     context = data.get("context", {})
 
-    # Bind context into hash
-    context_string = f"{username}{operation}{str(context)}"
+    db = get_db()
+
+    decision = risk_engine.evaluate(username, operation, context, db)
+
+    if decision.status == "DENY":
+
+        write_audit(
+            db, username, operation, "DENIED",
+            decision.score
+        )
+
+        return jsonify({
+            "status": "DENIED",
+            "risk": decision.score,
+            "factors": getattr(decision, "factors", []),
+            "reason": getattr(decision, "reason", "Denied by risk policy."),
+        }), 403
+
+    context_string = json.dumps({
+        "username": username,
+        "operation": operation,
+        "amount": context.get("amount")
+    }, sort_keys=True)
+
     context_hash = hashlib.sha256(context_string.encode()).hexdigest()
 
-    nonce = base64.b64encode(os.urandom(16)).decode()
+    nonce = base64.b64encode(secrets.token_bytes(32)).decode()
+    expires_at = time.time() + NONCE_TTL
 
-    OPERATION_NONCES[username] = {
-        "nonce": nonce,
-        "operation": operation,
-        "context_hash": context_hash,
-        "timestamp": time.time()
-    }
+    # Determine risk level label from score
+    score = decision.score
+    if score >= 70:
+        risk_level = "HIGH"
+    elif score >= 40:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+
+    db.execute(
+        "INSERT INTO nonces VALUES (?,?,?,?,?,0)",
+        (nonce, username, operation, context_hash, expires_at)
+    )
+
+    db.commit()
 
     return jsonify({
-        "nonce": nonce,
-        "operation": operation
+        "nonce":       nonce,
+        "contextHash": context_hash,   # SHA-256 of {username, operation, amount}
+        "expiresAt":   expires_at,     # Unix timestamp in seconds
+        "riskLevel":   risk_level,     # "LOW" | "MEDIUM" | "HIGH"
+        "riskScore":   score,
+        "status":      "OK",
     })
+
+
 # =====================================================
-# EXECUTE OPERATION WITH RISK ENGINE
+# EXECUTE OPERATION
 # =====================================================
-@app.route("/execute-operation", methods=["POST"])
+
+@app.post("/execute-operation")
 def execute_operation():
+
     data = request.json
+
     username = data["username"]
     operation = data["operation"]
     nonce = data["nonce"]
+    signature = data["signature"]
     context = data.get("context", {})
 
-    if username not in OPERATION_NONCES:
-        return jsonify({"status": "DENY", "reason": "No nonce"})
+    db = get_db()
 
-    stored = OPERATION_NONCES.pop(username)
+    nonce_row = db.execute(
+        """SELECT * FROM nonces
+        WHERE token=? AND username=? AND operation=? AND used=0""",
+        (nonce, username, operation)
+    ).fetchone()
 
-    # Verify nonce + operation
-    if nonce != stored["nonce"] or operation != stored["operation"]:
-        return jsonify({"status": "DENY", "reason": "Context mismatch"})
+    if not nonce_row:
+        return jsonify({"status": "DENIED"})
 
-    # Expiry check (60 sec)
-    if time.time() - stored["timestamp"] > 60:
-        return jsonify({"status": "DENY", "reason": "Expired"})
+    user = db.execute(
+        "SELECT public_key FROM users WHERE username=?",
+        (username,)
+    ).fetchone()
 
-    # Verify context hash
-    context_string = f"{username}{operation}{str(context)}"
-    incoming_hash = hashlib.sha256(context_string.encode()).hexdigest()
+    if not verify_signature(user["public_key"], nonce, signature):
+        return jsonify({"status": "DENIED"})
 
-    if incoming_hash != stored["context_hash"]:
-        return jsonify({"status": "DENY", "reason": "Tampered context"})
+    decision = risk_engine.evaluate(username, operation, context, db)
 
-    ip = request.remote_addr
-    risk = calculate_operation_risk(username, operation,ip,context)
+    db.execute(
+        "UPDATE nonces SET used=1 WHERE token=?",
+        (nonce,)
+    )
 
-    if risk < 0.3:
-        decision = "ALLOW"
-    elif risk < 0.7:
-        decision = "STEP_UP"
-    else:
-        decision = "DENY"
+    db.commit()
 
-    log_event(username, decision, risk, operation)
+    if decision.status == "DENY":
+        write_audit(db, username, operation, "DENIED", decision.score)
+        return jsonify({
+            "status": "DENIED",
+            "risk": decision.score,
+            "factors": getattr(decision, "factors", []),
+            "reason": getattr(decision, "reason", "Operation denied."),
+        })
+
+    if decision.status == "STEP_UP":
+        return jsonify({
+            "status": "STEP_UP",
+            "risk": decision.score,
+            "factors": getattr(decision, "factors", []),
+            "reason": getattr(decision, "reason", "Step-up authentication required."),
+        })
+
+    write_audit(db, username, operation, "SUCCESS", decision.score)
 
     return jsonify({
-        "status": decision,
-        "risk": risk
+        "status": "ALLOW",
+        "risk": decision.score,
     })
-# @app.route("/execute-operation", methods=["POST"])
-# def execute_operation():
-#     data = request.json
-#     username = data["username"]
-#     operation = data["operation"]
-#     nonce = data["nonce"]
 
-#     if username not in OPERATION_NONCES:
-#         return jsonify({"status": "DENY", "reason": "No nonce"})
 
-#     stored = OPERATION_NONCES.pop(username)
+# =====================================================
+# STEP-UP AUTHENTICATION
+# =====================================================
 
-#     if nonce != stored["nonce"] or operation != stored["operation"]:
-#         return jsonify({"status": "DENY", "reason": "Context mismatch"})
-
-#     if time.time() - stored["timestamp"] > 60:
-#         return jsonify({"status": "DENY", "reason": "Expired"})
-
-#     ip = request.remote_addr
-#     risk = calculate_operation_risk(username, operation, ip)
-
-#     if risk < 0.3:
-#         decision = "ALLOW"
-#     elif risk < 0.7:
-#         decision = "STEP_UP"
-#     else:
-#         decision = "DENY"
-
-#     log_event(username, decision, risk, operation)
-
-#     return jsonify({"status": decision, "risk": risk})
-@app.route("/stepup-challenge", methods=["POST"])
+@app.post("/stepup-challenge")
 def stepup_challenge():
-    data = request.json
-    username = data["username"]
-    operation = data["operation"]
 
-    nonce = base64.b64encode(os.urandom(32)).decode()
+    username = request.json["username"]
+    operation = request.json["operation"]
 
-    OPERATION_NONCES[username] = {
-        "nonce": nonce,
-        "operation": operation,
-        "timestamp": time.time(),
-        "stepup": True
-    }
+    nonce = base64.b64encode(secrets.token_bytes(32)).decode()
+
+    db = get_db()
+
+    db.execute(
+        "INSERT INTO nonces VALUES (?,?,?,?,?,0)",
+        (nonce, username, operation, None, time.time()+NONCE_TTL)
+    )
+
+    db.commit()
 
     return jsonify({"nonce": nonce})
 
-@app.route("/stepup-verify", methods=["POST"])
+
+@app.post("/stepup-verify")
 def stepup_verify():
+
     data = request.json
+
     username = data["username"]
     operation = data["operation"]
     signature = data["signature"]
+    nonce = data["nonce"]
 
-    if username not in OPERATION_NONCES:
-        return jsonify({"status": "DENY"})
+    db = get_db()
 
-    stored = OPERATION_NONCES.pop(username)
+    user = db.execute(
+        "SELECT public_key FROM users WHERE username=?",
+        (username,)
+    ).fetchone()
 
-    if stored["operation"] != operation:
-        return jsonify({"status": "DENY"})
+    if not verify_signature(user["public_key"], nonce, signature):
+        write_audit(db, username, operation, "STEPUP_DENIED")
+        return jsonify({"status": "DENIED"})
 
-    if time.time() - stored["timestamp"] > 60:
-        return jsonify({"status": "DENY"})
+    write_audit(db, username, operation, "STEPUP_SUCCESS")
 
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT public_key FROM users WHERE username=?", (username,))
-    row = c.fetchone()
-    conn.close()
+    return jsonify({"status": "UPGRADED_ALLOW"})
 
-    if not row:
-        return jsonify({"status": "DENY"})
 
-    ok = verify_signature(row[0], stored["nonce"], signature)
+# =====================================================
+# LOG APIs
+# =====================================================
 
-    if ok:
-        log_event(username, "STEPUP_SUCCESS", 0.2, operation)
-        return jsonify({"status": "UPGRADED_ALLOW"})
-    else:
-        log_event(username, "STEPUP_DENIED", 0.9, operation)
-        return jsonify({"status": "DENY"})
+@app.get("/logs")
+def logs():
+
+    db = get_db()
+
+    rows = db.execute(
+        "SELECT * FROM audit_logs ORDER BY id DESC LIMIT 100"
+    ).fetchall()
+
+    return jsonify([dict(r) for r in rows])
+
+
+@app.get("/verify-logs")
+def verify_logs():
+
+    db = get_db()
+
+    rows = db.execute(
+        "SELECT * FROM audit_logs ORDER BY id"
+    ).fetchall()
+
+    prev = "GENESIS"
+
+    for row in rows:
+
+        entry = f"{prev}|{row['user']}|{row['action']}|{row['result']}|{row['risk_score']}|{row['timestamp']}"
+
+        h = hashlib.sha256(entry.encode()).hexdigest()
+
+        if h != row["hash"]:
+            return jsonify({"integrity": "TAMPERED"})
+
+        prev = row["hash"]
+
+    return jsonify({"integrity": "OK"})
+
+
+# =====================================================
+# MAIN
+# =====================================================
 
 if __name__ == "__main__":
-    app.run(debug=True)
+
+    with app.app_context():
+        init_db()
+
+    app.run(debug=True, port=5000)
