@@ -96,11 +96,12 @@
 //     return res.json();
 //   },
 // };
+
 const BASE = "http://127.0.0.1:5000";
 
 export const Api = {
 
-  /* 🔑 Register new user public key */
+  /* 🔑 Register new user — returns totp_qr and totp_secret alongside REGISTERED */
   async registerUser(username: string, publicKey: string) {
     const res = await fetch(`${BASE}/register`, {
       method: "POST",
@@ -108,9 +109,10 @@ export const Api = {
       body: JSON.stringify({ username, publicKey }),
     });
     return res.json();
+    // Response: { status: "REGISTERED" | "EXISTS", totp_secret?, totp_qr? }
   },
 
-  /* 🔐 Get nonce challenge (POST — current active endpoint) */
+  /* 🔐 Get nonce challenge (POST) */
   async getLoginNonce(username: string) {
     const res = await fetch(`${BASE}/challenge`, {
       method: "POST",
@@ -120,7 +122,7 @@ export const Api = {
     return res.json();
   },
 
-  /* 🔐 Get challenge via legacy GET route (kept for backwards compatibility) */
+  /* 🔐 Get challenge via legacy GET route */
   async getChallenge(username: string) {
     const res = await fetch(`${BASE}/challenge/${username}`);
     return res.json();
@@ -148,7 +150,7 @@ export const Api = {
     return res.json();
   },
 
-  /* ⚙️ Get challenge for a sensitive operation */
+  /* ⚙️ Get context-aware nonce for a sensitive operation */
   async getOperationChallenge(username: string, operation: string, context: any) {
     const res = await fetch(`${BASE}/operation-challenge`, {
       method: "POST",
@@ -158,13 +160,13 @@ export const Api = {
     return res.json();
   },
 
-  /* ⚙️ Execute a sensitive operation (includes signature for server-side verification) */
+  /* ⚙️ Execute a sensitive operation with RSA signature */
   async executeOperation(
     username: string,
     operation: string,
     nonce: string,
     context: any,
-    signature: string,          // required: Dashboard always signs before executing
+    signature: string,
   ) {
     const res = await fetch(`${BASE}/execute-operation`, {
       method: "POST",
@@ -174,36 +176,27 @@ export const Api = {
     return res.json();
   },
 
-  /* 🪜 Get step-up authentication challenge */
-  async getStepUpChallenge(username: string, operation: string) {
-    const res = await fetch(`${BASE}/stepup-challenge`, {
+  /* 🪜 Step-up via TOTP — user enters 6-digit code from Google Authenticator */
+  async verifyStepUpTOTP(username: string, operation: string, code: string) {
+    const res = await fetch(`${BASE}/stepup-totp`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, operation }),
+      body: JSON.stringify({ username, operation, code }),
     });
     return res.json();
-  },
-
-  /* 🪜 Verify step-up authentication signature */
-  async verifyStepUp(username: string, operation: string, nonce: string, signature: string) {
-    const res = await fetch(`${BASE}/stepup-verify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, operation, nonce, signature }),
-    });
-    return res.json();
+    // Response: { status: "UPGRADED_ALLOW" | "DENY", reason? }
   },
 
   // ── Admin ──────────────────────────────────────────────────────────────────
 
-  /* 🛡️ Admin password login — returns session token */
+  /* 🛡️ Admin password login */
   async adminLogin(username: string, password: string) {
     const res = await fetch(`${BASE}/admin/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
     });
-    return res.json();   // { status, token }
+    return res.json();
   },
 
   /* 🛡️ Fetch full audit log (admin only) */
@@ -214,25 +207,22 @@ export const Api = {
     return res.json();
   },
 
-  /* 🛡️ Per-entry hash chain verification (admin only) */
+  /* 🛡️ Per-entry hash chain verification */
   async adminVerifyChain(token: string) {
     const res = await fetch(`${BASE}/admin/verify-chain`, {
       headers: { "X-Admin-Token": token },
     });
-    return res.json();   // { overall, entries: [...] }
+    return res.json();
   },
 
-  /* 🛡️ Simulate DB tampering — corrupts one log entry (demo only) */
+  /* 🛡️ Simulate DB tampering */
   async adminTamperLog(token: string, targetId?: number) {
     const res = await fetch(`${BASE}/admin/tamper-log`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Admin-Token": token,
-      },
+      headers: { "Content-Type": "application/json", "X-Admin-Token": token },
       body: JSON.stringify(targetId ? { target_id: targetId } : {}),
     });
-    return res.json();   // { status, tampered_id }
+    return res.json();
   },
 
   /* 🛡️ Restore chain after tamper demo */
@@ -241,6 +231,6 @@ export const Api = {
       method: "POST",
       headers: { "X-Admin-Token": token },
     });
-    return res.json();   // { status: "RESTORED" }
+    return res.json();
   },
 };

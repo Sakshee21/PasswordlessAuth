@@ -14,14 +14,13 @@ import { useAudit } from '../components/SecurityAuditPanel';
 
 interface LoginProps {
   onLoginSuccess: (username: string) => void;
-  onAdminSuccess: (token: string) => void;   // ← new: admin route
-  stepUpOperation?: string | null;           // ← existing: step-up re-auth
+  onAdminSuccess: (token: string) => void;
+  stepUpOperation?: string | null;
 }
 
 const Login: React.FC<LoginProps> = ({ onLoginSuccess, onAdminSuccess, stepUpOperation }) => {
   const { log, clear } = useAudit();
 
-  // ── User login / register state (untouched from existing) ──────────────────
   const [username, setUsername]               = useState('');
   const [activeTab, setActiveTab]             = useState<'login' | 'register' | 'admin'>('login');
   const [showFingerprint, setShowFingerprint] = useState(false);
@@ -34,17 +33,20 @@ const Login: React.FC<LoginProps> = ({ onLoginSuccess, onAdminSuccess, stepUpOpe
   >('idle');
   const [errorMessage, setErrorMessage] = useState('');
 
-  // ── Admin login state (new, isolated) ─────────────────────────────────────
-  const [adminUser, setAdminUser]       = useState('');
-  const [adminPass, setAdminPass]       = useState('');
-  const [adminError, setAdminError]     = useState('');
+  // ── TOTP setup — shown after successful registration ──────────────────────
+  const [totpQR,     setTotpQR]     = useState<string | null>(null);
+  const [totpSecret, setTotpSecret] = useState<string | null>(null);
+
+  // ── Admin login state ─────────────────────────────────────────────────────
+  const [adminUser,    setAdminUser]    = useState('');
+  const [adminPass,    setAdminPass]    = useState('');
+  const [adminError,   setAdminError]   = useState('');
   const [adminLoading, setAdminLoading] = useState(false);
 
   useEffect(() => {
     collectDeviceFingerprint().then(setFingerprintHash);
   }, []);
 
-  // If a step-up is pending, show a banner on the login tab
   const isStepUp = !!stepUpOperation;
 
   // ─── Registration ──────────────────────────────────────────────────────────
@@ -72,8 +74,12 @@ const Login: React.FC<LoginProps> = ({ onLoginSuccess, onAdminSuccess, stepUpOpe
       if (result.status === 'REGISTERED') {
         log('success', `User "${username}" registered on server. Public key stored in DB.`);
         log('info', 'Summary: Private key = encrypted in localStorage. Public key = on server. MasterKey = nowhere.');
+
+        // Store QR data — show TOTP setup screen before switching to login
+        if (result.totp_qr)     setTotpQR(result.totp_qr);
+        if (result.totp_secret) setTotpSecret(result.totp_secret);
         setStep('success');
-        setTimeout(() => { setStep('idle'); setActiveTab('login'); }, 2500);
+
       } else if (result.status === 'EXISTS') {
         deleteStoredKey(username);
         log('warning', 'Username already exists on server — local key bundle deleted');
@@ -194,7 +200,7 @@ const Login: React.FC<LoginProps> = ({ onLoginSuccess, onAdminSuccess, stepUpOpe
           </p>
         </div>
 
-        {/* Tabs — three tabs, admin is the last one */}
+        {/* Tabs */}
         <div className="flex border-b border-slate-200">
           {(['login', 'register', 'admin'] as const).map(tab => (
             <button
@@ -220,36 +226,94 @@ const Login: React.FC<LoginProps> = ({ onLoginSuccess, onAdminSuccess, stepUpOpe
 
           {/* ── Status overlay (user flows only) ── */}
           {step !== 'idle' && activeTab !== 'admin' && (
-            <div className="text-center py-8 space-y-6">
-              {step === 'success' ? (
-                <div className="inline-block p-4 bg-emerald-100 text-emerald-600 rounded-full">
-                  <ShieldCheck size={48} />
+
+            // ── TOTP Setup Screen (shown after registration success) ──────────
+            step === 'success' && activeTab === 'register' && totpQR ? (
+              <div className="space-y-5 text-center">
+                <div className="inline-block p-3 bg-emerald-100 text-emerald-600 rounded-full">
+                  <ShieldCheck size={36} />
                 </div>
-              ) : step === 'failed' ? (
-                <div className="inline-block p-4 bg-rose-100 text-rose-600 rounded-full">
-                  <ShieldAlert size={48} />
+                <div>
+                  <p className="font-bold text-slate-800 text-lg">One last step — set up your authenticator</p>
+                  <p className="text-slate-500 text-sm mt-1">
+                    Scan this QR with <strong>Google Authenticator</strong> (or any TOTP app).
+                    You'll need it every time a high-risk operation triggers step-up.
+                  </p>
                 </div>
-              ) : (
-                <Loader2 className="animate-spin text-blue-600 w-16 h-16 mx-auto" />
-              )}
-              <p className="font-semibold text-lg text-slate-800">{stepLabel[step]}</p>
-              {errorMessage && <p className="text-sm text-rose-600">{errorMessage}</p>}
-              {step === 'failed' && (
+
+                {/* QR Code */}
+                <div className="flex justify-center p-4 bg-white border-2 border-slate-200 rounded-2xl">
+                  <img
+                    src={`data:image/svg+xml;base64,${totpQR}`}
+                    alt="TOTP QR Code"
+                    className="w-52 h-52"
+                  />
+                </div>
+
+                {/* Backup text code */}
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl">
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
+                    Can't scan? Enter this key manually in your app:
+                  </p>
+                  <p className="font-mono text-sm font-bold text-slate-700 tracking-widest break-all">
+                    {totpSecret}
+                  </p>
+                </div>
+
+                <div className="p-3 bg-amber-50 border border-amber-100 rounded-xl text-xs text-amber-700 text-left flex items-start gap-2">
+                  <span className="text-base shrink-0">⚠️</span>
+                  <span>
+                    <strong>Save this code somewhere safe.</strong> If you lose access to your
+                    authenticator app, you won't be able to complete step-up.
+                    This QR will not be shown again.
+                  </span>
+                </div>
+
                 <button
-                  onClick={() => { setStep('idle'); setErrorMessage(''); }}
-                  className="px-6 py-2 border border-slate-300 rounded-full text-slate-600 hover:bg-slate-50"
+                  onClick={() => {
+                    setStep('idle');
+                    setActiveTab('login');
+                    setTotpQR(null);
+                    setTotpSecret(null);
+                  }}
+                  className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-4 rounded-lg transition-colors"
                 >
-                  Try Again
+                  ✅ I've saved my code — Go to Login
                 </button>
-              )}
-            </div>
+              </div>
+
+            ) : (
+              // ── Generic step progress overlay ──────────────────────────────
+              <div className="text-center py-8 space-y-6">
+                {step === 'success' ? (
+                  <div className="inline-block p-4 bg-emerald-100 text-emerald-600 rounded-full">
+                    <ShieldCheck size={48} />
+                  </div>
+                ) : step === 'failed' ? (
+                  <div className="inline-block p-4 bg-rose-100 text-rose-600 rounded-full">
+                    <ShieldAlert size={48} />
+                  </div>
+                ) : (
+                  <Loader2 className="animate-spin text-blue-600 w-16 h-16 mx-auto" />
+                )}
+                <p className="font-semibold text-lg text-slate-800">{stepLabel[step]}</p>
+                {errorMessage && <p className="text-sm text-rose-600">{errorMessage}</p>}
+                {step === 'failed' && (
+                  <button
+                    onClick={() => { setStep('idle'); setErrorMessage(''); }}
+                    className="px-6 py-2 border border-slate-300 rounded-full text-slate-600 hover:bg-slate-50"
+                  >
+                    Try Again
+                  </button>
+                )}
+              </div>
+            )
           )}
 
           {/* ── LOGIN FORM ── */}
           {step === 'idle' && activeTab === 'login' && (
             <form onSubmit={handleLogin} className="space-y-5">
 
-              {/* Step-up banner */}
               {isStepUp && (
                 <div className="flex items-start gap-3 p-3 bg-amber-50 border border-amber-200 rounded-lg">
                   <ShieldHalf size={16} className="text-amber-600 shrink-0 mt-0.5" />
@@ -328,6 +392,7 @@ const Login: React.FC<LoginProps> = ({ onLoginSuccess, onAdminSuccess, stepUpOpe
                   { icon: '🔒', title: 'Private Key Encrypted (AES-256-GCM)', sub: 'MasterKey = PBKDF2(device fingerprint + random salt)' },
                   { icon: '💾', title: 'Encrypted Bundle → localStorage',     sub: 'No .pem download, no plaintext on disk' },
                   { icon: '🌐', title: 'Public Key → Server DB',              sub: 'Used to verify RSA-PSS signatures at login' },
+                  { icon: '📱', title: 'TOTP Secret Generated',               sub: 'QR code shown once — scan with Google Authenticator' },
                 ].map(item => (
                   <div key={item.title} className="flex items-start gap-3 p-3">
                     <span className="text-lg">{item.icon}</span>
@@ -400,9 +465,7 @@ const Login: React.FC<LoginProps> = ({ onLoginSuccess, onAdminSuccess, stepUpOpe
                 disabled={adminLoading}
                 className="w-full bg-amber-600 hover:bg-amber-700 text-white font-bold py-4 rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-60"
               >
-                {adminLoading
-                  ? <Loader2 size={18} className="animate-spin" />
-                  : <ShieldHalf size={18} />}
+                {adminLoading ? <Loader2 size={18} className="animate-spin" /> : <ShieldHalf size={18} />}
                 Enter Admin Console
               </button>
             </form>

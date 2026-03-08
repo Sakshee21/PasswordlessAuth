@@ -560,6 +560,10 @@ import os
 import hashlib
 import time
 import secrets
+import io
+import pyotp
+import qrcode
+import qrcode.image.svg
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
@@ -576,8 +580,6 @@ OPERATION_NONCES = {}
 # =====================================================
 # ADMIN CREDENTIALS
 # Password = "admin1234"
-# To change: python3 -c "import hashlib,os,base64; s=os.urandom(16);
-#   print(base64.b64encode(s).decode(),'|',hashlib.pbkdf2_hmac('sha256',b'NEW_PW',s,260000).hex())"
 # =====================================================
 ADMIN_USERNAME = "admin"
 ADMIN_SALT_B64 = "TXlTZWN1cmVTYWx0MTY="
@@ -597,20 +599,21 @@ def init_db():
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
+            username   TEXT PRIMARY KEY,
             public_key TEXT NOT NULL,
-            last_ip TEXT
+            last_ip    TEXT,
+            totp_secret TEXT
         )
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user TEXT,
-            result TEXT,
-            timestamp REAL,
-            riskScore REAL,
-            action TEXT,
-            prev_hash TEXT,
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user         TEXT,
+            result       TEXT,
+            timestamp    REAL,
+            riskScore    REAL,
+            action       TEXT,
+            prev_hash    TEXT,
             current_hash TEXT
         )
     """)
@@ -679,25 +682,16 @@ def calculate_operation_risk(username, operation, ip, context):
         < 0.40  →  ALLOW
         < 0.70  →  STEP_UP
         >= 0.70 →  DENY
-
-    BUG FIXES vs original:
-      1. Operation base scores updated so READ/TRANSFER/WRITE are realistic
-      2. ALLOW threshold raised from 0.30 → 0.40 so WRITE and TRANSFER
-         actually trigger STEP_UP under normal conditions (not always ALLOW)
-      3. DELETE minimum is forced to STEP_UP regardless of other signals
-      4. Bot detection added using behavioural signals from riskEngine.ts
-      5. Session age penalty added for stale sessions on high-risk ops
-      6. Velocity check uses DB instead of in-memory nonce dict
     """
     risk = 0.0
     reasons = []
 
     # ── 1. Operation base risk ────────────────────────────────────────────────
     base_risk = {
-        "READ":     0.10,   # Low — read-only, least sensitive
-        "WRITE":    0.42,   # Medium — always STEP_UP (above 0.40 threshold)
-        "TRANSFER": 0.45,   # Medium-high — always STEP_UP
-        "DELETE":   0.55,   # High — irreversible account closure
+        "READ":     0.10,
+        "WRITE":    0.42,
+        "TRANSFER": 0.45,
+        "DELETE":   0.55,
     }
     op_upper = operation.upper()
     risk += base_risk.get(op_upper, 0.20)
@@ -730,11 +724,11 @@ def calculate_operation_risk(username, operation, ip, context):
         risk += 0.20
         reasons.append("Unusual hour — outside 06:00–22:00")
 
-    # ── 5. Behavioural bot signals from riskEngine.ts ────────────────────────
-    no_mouse    = not context.get("mouseMovementDetected", True)
-    no_keyboard = not context.get("keyboardInteractionDetected", True)
+    # ── 5. Behavioural bot signals ────────────────────────────────────────────
+    no_mouse     = not context.get("mouseMovementDetected", True)
+    no_keyboard  = not context.get("keyboardInteractionDetected", True)
     time_on_page = context.get("timeOnPageMs", 9999)
-    too_fast    = time_on_page < 800   # < 800ms = almost certainly automated
+    too_fast     = time_on_page < 800
 
     if no_mouse and no_keyboard and too_fast:
         risk += 0.30
@@ -752,21 +746,18 @@ def calculate_operation_risk(username, operation, ip, context):
     conn.close()
     if recent_count > 5:
         excess = recent_count - 5
-        velocity_penalty = min(excess * 0.10, 0.30)
-        risk += velocity_penalty
+        risk += min(excess * 0.10, 0.30)
         reasons.append(f"High velocity: {recent_count} ops in last 2 minutes")
 
-    # ── 7. Session age (high-risk ops need a fresh session) ───────────────────
-    session_age_ms = context.get("sessionAgeMs", 0)
+    # ── 7. Session age ────────────────────────────────────────────────────────
+    session_age_ms  = context.get("sessionAgeMs", 0)
     session_age_sec = session_age_ms / 1000
     if session_age_sec > 1800 and op_upper in ("WRITE", "TRANSFER", "DELETE"):
         risk += 0.20
         reasons.append(f"Stale session ({session_age_sec/60:.0f} min old) for sensitive op")
 
-    # ── Cap ───────────────────────────────────────────────────────────────────
     risk = min(risk, 1.0)
 
-    # ── DELETE minimum: always at least STEP_UP ───────────────────────────────
     if op_upper == "DELETE" and risk < 0.40:
         risk = 0.40
 
@@ -774,7 +765,7 @@ def calculate_operation_risk(username, operation, ip, context):
 
 
 # =====================================================
-# USER REGISTRATION
+# USER REGISTRATION — now generates TOTP secret + QR
 # =====================================================
 @app.route("/register", methods=["POST"])
 def register():
@@ -789,14 +780,32 @@ def register():
         conn.close()
         return jsonify({"status": "EXISTS"})
 
+    # Generate TOTP secret for this user
+    totp_secret = pyotp.random_base32()
+
     c.execute(
-        "INSERT INTO users (username, public_key) VALUES (?, ?)",
-        (username, public_key)
+        "INSERT INTO users (username, public_key, totp_secret) VALUES (?, ?, ?)",
+        (username, public_key, totp_secret)
     )
     conn.commit()
     conn.close()
 
-    return jsonify({"status": "REGISTERED"})
+    # Build QR code from otpauth:// URI
+    totp_uri = pyotp.totp.TOTP(totp_secret).provisioning_uri(
+        name=username,
+        issuer_name="SecureBank Demo"
+    )
+    factory = qrcode.image.svg.SvgPathImage
+    qr_img  = qrcode.make(totp_uri, image_factory=factory)
+    buf     = io.BytesIO()
+    qr_img.save(buf)
+    qr_b64  = base64.b64encode(buf.getvalue()).decode()
+
+    return jsonify({
+        "status":      "REGISTERED",
+        "totp_secret": totp_secret,   # backup text code shown to user
+        "totp_qr":     qr_b64,        # base64 SVG — rendered as <img> in browser
+    })
 
 
 # =====================================================
@@ -998,25 +1007,25 @@ def operation_challenge():
     context_hash   = hashlib.sha256(context_string.encode()).hexdigest()
     nonce          = base64.b64encode(os.urandom(16)).decode()
     issued_at      = time.time()
-    expires_at     = issued_at + 60     # nonce valid for 60 seconds
+    expires_at     = issued_at + 60
 
     OPERATION_NONCES[username] = {
         "nonce":        nonce,
         "operation":    operation,
         "context_hash": context_hash,
-        "timestamp":    issued_at,      # used by execute-operation expiry check
+        "timestamp":    issued_at,
     }
 
     return jsonify({
-        "nonce":        nonce,
-        "operation":    operation,
-        "contextHash":  context_hash,   # SHA-256(username+operation+context)
-        "expiresAt":    expires_at,     # Unix timestamp — frontend shows countdown
+        "nonce":       nonce,
+        "operation":   operation,
+        "contextHash": context_hash,   # camelCase — what Dashboard.tsx reads
+        "expiresAt":   expires_at,     # Unix timestamp — frontend shows countdown
     })
 
 
 # =====================================================
-# EXECUTE OPERATION — now also verifies RSA signature
+# EXECUTE OPERATION
 # =====================================================
 @app.route("/execute-operation", methods=["POST"])
 def execute_operation():
@@ -1025,7 +1034,7 @@ def execute_operation():
     operation = data["operation"]
     nonce     = data["nonce"]
     context   = data.get("context", {})
-    signature = data.get("signature", "")   # RSA-PSS signature from frontend
+    signature = data.get("signature", "")
 
     # ── 1. Nonce must exist ───────────────────────────────────────────────────
     if username not in OPERATION_NONCES:
@@ -1037,19 +1046,17 @@ def execute_operation():
     if nonce != stored["nonce"] or operation != stored["operation"]:
         return jsonify({"status": "DENY", "reason": "Nonce / operation mismatch"})
 
-    # ── 3. Nonce must not be expired (60s window) ─────────────────────────────
+    # ── 3. Nonce expiry (60s) ─────────────────────────────────────────────────
     if time.time() - stored["timestamp"] > 60:
         return jsonify({"status": "DENY", "reason": "Nonce expired"})
 
-    # ── 4. Context hash must match (prevents context tampering) ──────────────
+    # ── 4. Context hash must match ────────────────────────────────────────────
     context_string = f"{username}{operation}{str(context)}"
     incoming_hash  = hashlib.sha256(context_string.encode()).hexdigest()
     if incoming_hash != stored["context_hash"]:
         return jsonify({"status": "DENY", "reason": "Context was tampered after challenge"})
 
     # ── 5. RSA-PSS signature verification ────────────────────────────────────
-    #    This proves the nonce was signed by the device holding the private key,
-    #    not just replayed by someone who intercepted it on the wire.
     if signature:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -1062,7 +1069,6 @@ def execute_operation():
             log_event(username, "INVALID_SIGNATURE", 0.95, operation)
             return jsonify({"status": "DENY", "reason": "Invalid signature — possible replay attack"})
     else:
-        # No signature provided — deny, don't allow unsigned operation execution
         return jsonify({"status": "DENY", "reason": "Signature required"})
 
     # ── 6. Risk scoring ───────────────────────────────────────────────────────
@@ -1079,63 +1085,45 @@ def execute_operation():
     log_event(username, decision, risk, operation)
     return jsonify({
         "status":  decision,
-        "risk":    round(risk * 100),   # return as 0–100 so UI matches risk_policy.py scale
-        "reasons": reasons
+        "risk":    round(risk * 100),
+        "reasons": reasons,
     })
 
 
 # =====================================================
-# STEP-UP AUTHENTICATION (RSA re-sign with device key)
+# STEP-UP — TOTP (Google Authenticator)
+# Replaces the old RSA re-sign approach.
+# Proves possession of a SEPARATE device (phone),
+# not just the laptop that was used to log in.
 # =====================================================
-@app.route("/stepup-challenge", methods=["POST"])
-def stepup_challenge():
-    data      = request.json
-    username  = data["username"]
-    operation = data["operation"]
-    nonce     = base64.b64encode(os.urandom(32)).decode()
-    OPERATION_NONCES[username] = {
-        "nonce":     nonce,
-        "operation": operation,
-        "timestamp": time.time(),
-        "stepup":    True
-    }
-    return jsonify({"nonce": nonce})
+@app.route("/stepup-totp", methods=["POST"])
+def stepup_totp():
+    data      = request.json or {}
+    username  = data.get("username", "")
+    operation = data.get("operation", "")
+    code      = str(data.get("code", "")).strip()
 
-
-@app.route("/stepup-verify", methods=["POST"])
-def stepup_verify():
-    data      = request.json
-    username  = data["username"]
-    operation = data["operation"]
-    signature = data["signature"]
-
-    if username not in OPERATION_NONCES:
-        return jsonify({"status": "DENY", "reason": "No pending step-up"})
-
-    stored = OPERATION_NONCES.pop(username)
-
-    if stored["operation"] != operation:
-        return jsonify({"status": "DENY", "reason": "Operation mismatch"})
-
-    if time.time() - stored["timestamp"] > 60:
-        return jsonify({"status": "DENY", "reason": "Step-up nonce expired"})
+    if not username or not operation or not code:
+        return jsonify({"status": "DENY", "reason": "Missing fields"})
 
     conn = sqlite3.connect(DB_FILE)
     c    = conn.cursor()
-    c.execute("SELECT public_key FROM users WHERE username=?", (username,))
+    c.execute("SELECT totp_secret FROM users WHERE username=?", (username,))
     row  = c.fetchone()
     conn.close()
 
-    if not row:
-        return jsonify({"status": "DENY", "reason": "User not found"})
+    if not row or not row[0]:
+        return jsonify({"status": "DENY", "reason": "TOTP not configured for this user"})
 
-    ok = verify_signature(row[0], stored["nonce"], signature)
+    # valid_window=1 allows ±30s clock drift between phone and server
+    ok = pyotp.TOTP(row[0]).verify(code, valid_window=1)
+
     if ok:
-        log_event(username, "STEPUP_SUCCESS", 0.2, operation)
+        log_event(username, "STEPUP_TOTP_SUCCESS", 0.15, operation)
         return jsonify({"status": "UPGRADED_ALLOW"})
     else:
-        log_event(username, "STEPUP_DENIED", 0.9, operation)
-        return jsonify({"status": "DENY", "reason": "Signature verification failed"})
+        log_event(username, "STEPUP_TOTP_DENIED", 0.9, operation)
+        return jsonify({"status": "DENY", "reason": "Invalid or expired code — wait for next 30s window"})
 
 
 # =====================================================
