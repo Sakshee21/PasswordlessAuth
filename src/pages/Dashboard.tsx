@@ -11,6 +11,7 @@ import { OperationType, RiskLevel } from '../types';
 import { Api } from '../services/api';
 import { collectRiskContext, recordOperation } from '../utils/riskEngine';
 import { decryptAndSign } from '../utils/deviceKey';
+import { useAudit } from '../components/SecurityAuditPanel';
 
 interface DashboardProps {
   user: string;
@@ -323,6 +324,7 @@ const DeleteView: React.FC<{ user: string; onBack: () => void }> = ({ user, onBa
 // ─── Main Dashboard ───────────────────────────────────────────────────────────
 
 const Dashboard: React.FC<DashboardProps> = ({ user, onNavigate, onStepUp, pendingOperation, onStepUpComplete }) => {
+  const { log } = useAudit();
   const [op, setOp]               = useState<OpState>(INITIAL);
   const [activeView, setActiveView] = useState<OperationType | null>(null);
   const [totpCode, setTotpCode]   = useState('');
@@ -340,7 +342,10 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onNavigate, onStepUp, pendi
   // ── Core auth flow — can be called fresh or as a retry ──
   const runOperation = async (operationId: OperationType) => {
     setOp({ ...INITIAL, status: 'collecting', operationId, message: 'Gathering device & behavioural signals…' });
+    log('info', `── Operation started: ${operationId} ──`);
     try {
+      // ── Step 1: Collect context signals ──────────────────────────────────
+      log('info', `Collecting device & behavioural signals for ${operationId}…`);
       const riskCtx = await collectRiskContext(operationId);
       const contextDetails: ContextDetails = {
         deviceFingerprint: riskCtx.deviceFingerprint, sessionAgeMs: riskCtx.sessionAgeMs,
@@ -349,14 +354,24 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onNavigate, onStepUp, pendi
         keyboardInteractionDetected: riskCtx.keyboardInteractionDetected,
         timeOnPageMs: riskCtx.timeOnPageMs,
       };
+      log('crypto', 'Device fingerprint (SHA-256) collected', riskCtx.deviceFingerprint.slice(0, 32) + '…');
+      log('info',   `Session age: ${(riskCtx.sessionAgeMs/1000).toFixed(1)}s · Mouse: ${riskCtx.mouseMovementDetected ? 'YES' : 'NO'} · Keyboard: ${riskCtx.keyboardInteractionDetected ? 'YES' : 'NO'}`);
+      log('info',   `Connection: ${riskCtx.connectionType} · Timezone: ${riskCtx.timezone}`);
 
+      // ── Step 2: Request context-bound nonce ───────────────────────────────
       setOp(s => ({ ...s, status: 'challenging', contextDetails, message: 'Sending context to server — requesting bound nonce…' }));
+      log('network', `POST /operation-challenge — binding context to nonce for ${operationId}…`);
       const challengeResp = await Api.getOperationChallenge(user, operationId, riskCtx);
 
       if (challengeResp.status === 'DENIED') {
+        log('error', `Challenge denied by server: ${challengeResp.reason ?? 'risk policy'}`);
         setOp(s => ({ ...s, status: 'denied', riskScore: challengeResp.risk ?? 0, riskReasons: challengeResp.factors ?? [], message: challengeResp.reason ?? 'Denied by risk policy.' }));
         return;
       }
+
+      log('network', 'Nonce received from server', challengeResp.nonce?.slice(0, 20) + '…');
+      log('crypto',  'Context hash (SHA-256 of username+operation+context)', challengeResp.contextHash?.slice(0, 32) + '…');
+      log('info',    `Nonce expires in 60s — bound to this exact context, single-use`);
 
       const nonceDetails: NonceDetails = {
         nonce: challengeResp.nonce, contextHash: challengeResp.contextHash ?? '—',
@@ -364,23 +379,40 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onNavigate, onStepUp, pendi
         riskScore: challengeResp.riskScore ?? 0,
       };
 
+      // ── Step 3: Decrypt private key + sign nonce ──────────────────────────
       setOp(s => ({ ...s, status: 'signing', nonceDetails, message: 'Decrypting device key & signing the bound nonce…' }));
+      log('info',   'Loading encrypted key bundle from localStorage…');
+      log('crypto', 'Re-collecting device fingerprint to re-derive MasterKey…');
+      log('crypto', 'PBKDF2-SHA256 (310,000 iterations) → AES-256 MasterKey derived in RAM');
+      log('crypto', 'AES-256-GCM decryption → private key bytes in RAM');
       const signature = await decryptAndSign(user, challengeResp.nonce);
+      log('crypto', 'RSA-PSS signature computed over context-bound nonce');
+      log('ram',    '🗑️  Private key bytes zeroed — no longer in memory');
 
+      // ── Step 4: Execute operation (server risk gate) ──────────────────────
       setOp(s => ({ ...s, status: 'executing', message: 'Sending signed nonce — server running final risk gate…' }));
+      log('network', 'POST /execute-operation — sending nonce + signature + context…');
+      log('info',    'Server will: verify nonce → check expiry → verify context hash → verify RSA signature → run risk engine');
       const execResp = await Api.executeOperation(user, operationId, challengeResp.nonce, riskCtx, signature);
 
       recordOperation();
 
+      // ── Step 5: Handle server decision ────────────────────────────────────
       if (execResp.status === 'ALLOW') {
+        log('success', `✅ Server decision: ALLOW (risk=${execResp.risk}/100) — operation authorized`);
         setOp(s => ({ ...s, status: 'allowed', riskScore: execResp.risk ?? 0, message: 'Operation authorised — context verified ✓' }));
         setTimeout(() => { closeModal(); setActiveView(operationId); }, 1500);
       } else if (execResp.status === 'STEP_UP') {
+        log('warning', `⚠️ Server decision: STEP_UP (risk=${execResp.risk}/100) — second factor required`);
+        if (execResp.reasons?.length) log('warning', `Risk factors: ${execResp.reasons.join(' · ')}`);
         setOp(s => ({ ...s, status: 'step_up', riskScore: execResp.risk ?? 0, riskReasons: execResp.factors ?? [], message: execResp.reason ?? 'Step-up authentication required.' }));
       } else {
+        log('error', `❌ Server decision: DENY (risk=${execResp.risk}/100) — ${execResp.reason ?? 'risk too high'}`);
+        if (execResp.reasons?.length) log('error', `Risk factors: ${execResp.reasons.join(' · ')}`);
         setOp(s => ({ ...s, status: 'denied', riskScore: execResp.risk ?? 0, riskReasons: execResp.factors ?? [], message: execResp.reason ?? 'Operation denied.' }));
       }
     } catch (err: any) {
+      log('error', 'Operation flow error: ' + (err.message ?? 'Unexpected error'));
       setOp(s => ({ ...s, status: 'error', message: err.message ?? 'Unexpected error.' }));
     }
   };
@@ -397,14 +429,20 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onNavigate, onStepUp, pendi
     }
 
     setOp(s => ({ ...s, status: 'stepup_signing', message: 'Verifying authenticator code…' }));
+    log('info',    `── Step-Up: TOTP verification for ${operationId} ──`);
+    log('network', 'POST /stepup-totp — sending 6-digit TOTP code to server…');
+    log('info',    'Server will: fetch totp_secret from DB → pyotp.TOTP(secret).verify(code)');
     try {
       const result = await Api.verifyStepUpTOTP(user, operationId, code);
 
       if (result.status === 'UPGRADED_ALLOW') {
+        log('success', '✅ TOTP verified — second factor confirmed (phone possession proven)');
+        log('info',    'Two factors satisfied: device-bound key (laptop) + TOTP (phone)');
         setTotpCode('');
         setOp(s => ({ ...s, status: 'allowed', message: '✅ Authenticator code verified — operation authorized.' }));
         setTimeout(() => { closeModal(); setActiveView(operationId); }, 1500);
       } else {
+        log('error', `❌ TOTP verification failed: ${result.reason ?? 'invalid code'}`);
         setTotpCode('');
         setOp(s => ({
           ...s,
@@ -415,6 +453,7 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onNavigate, onStepUp, pendi
         }));
       }
     } catch (err: any) {
+      log('error', 'Step-up error: ' + (err.message ?? 'Unexpected error'));
       setOp(s => ({ ...s, status: 'error', message: err.message ?? 'Step-up failed.' }));
     }
   };
