@@ -44,6 +44,8 @@ interface NonceDetails { nonce: string; contextHash: string; expiresAt: number; 
 interface ContextDetails { deviceFingerprint: string; sessionAgeMs: number; timezone: string; connectionType: string; mouseMovementDetected: boolean; keyboardInteractionDetected: boolean; timeOnPageMs: number; }
 interface OpState { status: OpStatus; operationId: OperationType | null; riskScore: number; riskReasons: string[]; message: string; nonceDetails: NonceDetails | null; contextDetails: ContextDetails | null; }
 
+// TOTP code input state — lives outside OpState so it persists while modal is open
+// Declared at module scope so it's accessible in both handler and JSX
 const INITIAL: OpState = { status: 'idle', operationId: null, riskScore: 0, riskReasons: [], message: '', nonceDetails: null, contextDetails: null };
 
 const STEPS = [
@@ -321,11 +323,12 @@ const DeleteView: React.FC<{ user: string; onBack: () => void }> = ({ user, onBa
 // ─── Main Dashboard ───────────────────────────────────────────────────────────
 
 const Dashboard: React.FC<DashboardProps> = ({ user, onNavigate, onStepUp, pendingOperation, onStepUpComplete }) => {
-  const [op, setOp] = useState<OpState>(INITIAL);
+  const [op, setOp]               = useState<OpState>(INITIAL);
   const [activeView, setActiveView] = useState<OperationType | null>(null);
+  const [totpCode, setTotpCode]   = useState('');
 
   // Close modal and go back to dashboard grid (does NOT reset activeView)
-  const closeModal = () => setOp(INITIAL);
+  const closeModal = () => { setOp(INITIAL); setTotpCode(''); };
 
   useEffect(() => {
     if (pendingOperation) {
@@ -382,24 +385,34 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onNavigate, onStepUp, pendi
     }
   };
 
-  // ── Inline Step-Up: signs with device key, no Login redirect ──
-  const handleInlineStepUp = async () => {
+  // ── TOTP Step-Up: user enters 6-digit code from Google Authenticator ──
+  const handleTOTPStepUp = async () => {
     if (!op.operationId) return;
     const operationId = op.operationId;
-    setOp(s => ({ ...s, status: 'stepup_signing', message: 'Requesting step-up challenge from server…' }));
+    const code = totpCode.trim();
+
+    if (code.length !== 6 || !/^\d{6}$/.test(code)) {
+      setOp(s => ({ ...s, message: 'Enter the 6-digit code from your authenticator app.' }));
+      return;
+    }
+
+    setOp(s => ({ ...s, status: 'stepup_signing', message: 'Verifying authenticator code…' }));
     try {
-      const challenge = await Api.getStepUpChallenge(user, operationId);
-      setOp(s => ({ ...s, message: 'Signing step-up nonce with device key…' }));
-      const signature = await decryptAndSign(user, challenge.nonce);
-      setOp(s => ({ ...s, message: 'Verifying step-up signature on server…' }));
-      const result = await Api.verifyStepUp(user, operationId, challenge.nonce, signature);
+      const result = await Api.verifyStepUpTOTP(user, operationId, code);
 
       if (result.status === 'UPGRADED_ALLOW') {
-        setOp(s => ({ ...s, status: 'allowed', message: '✅ Step-up verified — operation now authorized.' }));
+        setTotpCode('');
+        setOp(s => ({ ...s, status: 'allowed', message: '✅ Authenticator code verified — operation authorized.' }));
         setTimeout(() => { closeModal(); setActiveView(operationId); }, 1500);
       } else {
-        // Step-up failed → offer retry without leaving the modal
-        setOp(s => ({ ...s, status: 'denied', message: 'Step-up verification failed. You can try again.' }));
+        setTotpCode('');
+        setOp(s => ({
+          ...s,
+          status: 'step_up',
+          message: result.reason === 'Invalid or expired code'
+            ? '❌ Wrong code — wait for the next 30s window and try again.'
+            : 'Step-up failed. Try again.',
+        }));
       }
     } catch (err: any) {
       setOp(s => ({ ...s, status: 'error', message: err.message ?? 'Step-up failed.' }));
@@ -582,14 +595,46 @@ const Dashboard: React.FC<DashboardProps> = ({ user, onNavigate, onStepUp, pendi
               {/* ── Step-Up CTA: inline device-key re-auth ── */}
               {op.status === 'step_up' && (
                 <div className="space-y-3">
-                  <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg p-3 text-center">
-                    Risk score is in the STEP_UP band (40–69). Re-signing with your device key will satisfy the elevated check.
-                  </p>
-                  <button onClick={handleInlineStepUp}
-                    className="w-full flex items-center justify-center gap-2 py-3 bg-amber-500 text-white font-bold rounded-lg hover:bg-amber-600 transition-colors">
-                    <RefreshCw size={16} /> Re-Authenticate with Device Key
+
+                  {/* Explanation banner */}
+                  <div className="p-3 bg-amber-50 border border-amber-100 rounded-xl text-xs text-amber-800 space-y-1">
+                    <p className="font-bold">🔐 Step-Up Authentication Required</p>
+                    <p>
+                      This operation has a risk score in the medium band.
+                      Open <strong>Google Authenticator</strong> on your phone and
+                      enter the 6-digit code for <strong>SecureBank Demo</strong>.
+                    </p>
+                  </div>
+
+                  {/* 6-digit input */}
+                  <div className="flex flex-col items-center gap-3">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      maxLength={6}
+                      value={totpCode}
+                      onChange={e => setTotpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      placeholder="_ _ _ _ _ _"
+                      className="w-48 text-center text-3xl font-mono font-bold tracking-[0.4em] py-3 px-4 border-2 border-amber-300 rounded-xl focus:outline-none focus:border-amber-500 bg-amber-50"
+                      autoFocus
+                    />
+                    <p className="text-[10px] text-slate-400">
+                      Code refreshes every 30 seconds
+                    </p>
+                  </div>
+
+                  <button
+                    onClick={handleTOTPStepUp}
+                    disabled={totpCode.length !== 6}
+                    className="w-full flex items-center justify-center gap-2 py-3 bg-amber-500 text-white font-bold rounded-lg hover:bg-amber-600 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <ShieldCheck size={16} /> Verify Code
                   </button>
-                  <p className="text-[10px] text-slate-400 text-center">Your encrypted key stays on this device. No password or PEM file needed.</p>
+
+                  {op.message.startsWith('❌') && (
+                    <p className="text-xs text-rose-600 text-center">{op.message}</p>
+                  )}
                 </div>
               )}
 
