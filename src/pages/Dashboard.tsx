@@ -28,7 +28,7 @@ const riskStyles: Record<RiskLevel, string> = {
 };
 
 const OPERATIONS = [
-  { id: OperationType.READ,     title: 'Sensitive Records', desc: 'View confidential profile and activity data.', icon: <FileText className="text-blue-600" />,      risk: RiskLevel.LOW    },
+  { id: OperationType.READ,     title: 'User Profile', desc: 'View confidential profile and activity data.', icon: <FileText className="text-blue-600" />,      risk: RiskLevel.LOW    },
   { id: OperationType.WRITE,    title: 'Account Details',   desc: 'Update personal settings and contact info.',  icon: <UserCircle className="text-amber-600" />,    risk: RiskLevel.MEDIUM },
   { id: OperationType.TRANSFER, title: 'Transfer Money',    desc: 'Send funds to other accounts securely.',      icon: <ArrowRightLeft className="text-blue-600" />, risk: RiskLevel.MEDIUM },
   { id: OperationType.DELETE,   title: 'Close Account',     desc: 'Permanently delete account and all data.',    icon: <Trash2 className="text-rose-600" />,         risk: RiskLevel.HIGH   },
@@ -70,7 +70,7 @@ const ReadView: React.FC<{ user: string; onBack: () => void }> = ({ user, onBack
       <div className="bg-slate-900 p-6 text-white flex items-center gap-3">
         <div className="p-2 bg-blue-600/30 rounded-lg"><FileText size={20} className="text-blue-400" /></div>
         <div>
-          <h2 className="font-bold text-lg">Sensitive Records</h2>
+          <h2 className="font-bold text-lg">User Profile</h2>
           <p className="text-slate-400 text-xs">Access granted · Context-verified session</p>
         </div>
         <span className="ml-auto text-[10px] bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-1 rounded-full font-bold">🔓 UNLOCKED</span>
