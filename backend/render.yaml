@@ -2,13 +2,5 @@ services:
   - type: web
     name: securebank-backend
     env: python
-    rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
-    disk:
-      name: securebank-data
-      mountPath: /data
-      sizeGB: 1
-    envVars:
-      - key: DB_PATH
-        value: /data/securebank.db
