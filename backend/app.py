@@ -572,7 +572,7 @@ from cryptography.exceptions import InvalidSignature
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-DB_FILE = "securebank.db"
+DB_FILE = os.environ.get("DB_PATH", "securebank.db")
 
 LOGIN_NONCES     = {}
 OPERATION_NONCES = {}
@@ -621,6 +621,11 @@ def init_db():
     conn.close()
 
 init_db()
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
 # =====================================================
 # HELPERS
