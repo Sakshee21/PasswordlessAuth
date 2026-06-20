@@ -570,7 +570,10 @@ from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from cryptography.exceptions import InvalidSignature
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": [
+    "http://localhost:5173",
+    "https://contextdriftlock.onrender.com"   # ← your actual frontend URL
+]}})
 
 DB_FILE = os.environ.get("DB_PATH", "securebank.db")
 
