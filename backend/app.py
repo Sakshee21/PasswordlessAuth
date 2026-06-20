@@ -570,9 +570,12 @@ from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from cryptography.exceptions import InvalidSignature
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": [
+    "http://localhost:5173",
+    "https://contextdriftlock.onrender.com"   # ← your actual frontend URL
+]}})
 
-DB_FILE = "securebank.db"
+DB_FILE = os.environ.get("DB_PATH", "securebank.db")
 
 LOGIN_NONCES     = {}
 OPERATION_NONCES = {}
@@ -621,6 +624,11 @@ def init_db():
     conn.close()
 
 init_db()
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
 # =====================================================
 # HELPERS
@@ -1170,4 +1178,4 @@ def verify_logs():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True)# deployment test
